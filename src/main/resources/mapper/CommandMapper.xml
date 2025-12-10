@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.edog.mapper.CommandMapper">
+
+    <!-- ✅ 查询指定账号下的所有命令 -->
+    <select id="getAllCommandByAccount" resultType="com.example.edog.entity.Command">
+        SELECT * FROM Command WHERE account = #{account}
+    </select>
+
+    <!-- ✅ 根据账号和命令内容查找单条记录（用于判断是否存在） -->
+    <select id="findByAccountAndContent" resultType="com.example.edog.entity.Command">
+        SELECT * FROM Command WHERE account = #{account} AND content = #{content} LIMIT 1
+    </select>
+
+    <!-- ✅ 插入命令 -->
+    <insert id="insertCommand" parameterType="com.example.edog.entity.Command">
+        INSERT INTO Command (account, content, message)
+        VALUES (#{account}, #{content}, #{message})
+    </insert>
+
+    <!-- ✅ 更新命令消息 -->
+    <update id="updateMessageByAccountAndContent">
+        UPDATE Command
+        SET message = #{message}
+        WHERE account = #{account} AND content = #{content}
+    </update>
+
+    <!-- ✅ 删除命令 -->
+    <delete id="deleteByAccountAndContent">
+        DELETE FROM Command
+        WHERE account = #{account} AND content = #{content}
+    </delete>
+
+</mapper>

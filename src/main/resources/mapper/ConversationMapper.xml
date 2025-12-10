@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!-- namespace 必须与 Mapper 接口完全一致 -->
+<mapper namespace="com.example.edog.mapper.ConversationMapper">
+
+    <!-- 查询账号对应的所有对话（新→旧） -->
+    <select id="getConversationsByAccount" parameterType="long" resultType="com.example.edog.entity.Conversation">
+        SELECT id, account, answer, reply, create_time
+        FROM Conversation
+        WHERE account = #{account}
+        ORDER BY create_time
+    </select>
+
+    <!-- 插入新记录 -->
+    <insert id="insertConversation"
+            parameterType="com.example.edog.entity.Conversation"
+            useGeneratedKeys="true"
+            keyProperty="id">
+        INSERT INTO Conversation (account, answer, reply, create_time)
+        VALUES (#{account}, #{answer}, #{reply}, NOW())
+    </insert>
+
+    <!-- 删除指定账号下的对话 -->
+    <delete id="deleteByAccountAndAnswer" parameterType="map">
+        DELETE FROM Conversation
+        WHERE account = #{account}
+          AND reply = #{reply}
+    </delete>
+
+</mapper>

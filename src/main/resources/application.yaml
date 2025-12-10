@@ -1,0 +1,26 @@
+spring:
+  datasource:
+    url: jdbc:mysql://sh-cynosdbmysql-grp-mtd4hmc8.sql.tencentcdb.com:28669/EDOG?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useSSL=false
+    username: root
+    password: Mimawangle2
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 300000
+      connection-timeout: 20000
+      pool-name: HikariCP
+
+server:
+  port: 8080
+
+# 扣子智能体配置
+kouzi:
+  agent:
+    base-url: https://api.coze.cn/v3/chat
+    token: sat_LeDY8iu23Ifcb2UwY7LXfZeL0HhoF4NTswQmlooFVJyRJNd7ExEk9gFogjnRPbPl
+    bot-id: "7534905232841785370"
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.example.edog.entity
