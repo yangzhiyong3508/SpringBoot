@@ -14,8 +14,8 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
 import java.util.Timer;
@@ -142,41 +142,61 @@ public class WebSocketServer extends AbstractWebSocketHandler {
                     System.out.println("音频URL: " + (audioUrl.isEmpty() ? "无" : audioUrl));
                     System.out.println("文本结果: " + textResult);
                     
-                    // 下载并转换音频
-                    String oggFilePath = null;
+                    // 下载并转换音频为裸 Opus 帧
+                    List<byte[]> opusFrames = null;
                     if (!audioUrl.isEmpty()) {
                         // 1. 下载 MP3
                         String mp3FilePath = cozeAPI.downloadAudio(audioUrl, "coze_audio");
                         
-                        // 2. 转换为 OGG/Opus 格式 (设备端可接受的格式)
+                        // 2. 转换为裸 Opus 帧 (设备端要求的格式)
                         if (mp3FilePath != null) {
-                            oggFilePath = AudioConverter.convertMp3ToOpusOgg(mp3FilePath);
-                            if (oggFilePath != null) {
-                                System.out.println("音频已转换为设备格式: " + oggFilePath);
+                            opusFrames = AudioConverter.convertMp3ToOpusFrames(mp3FilePath);
+                            if (opusFrames != null && !opusFrames.isEmpty()) {
+                                System.out.println("音频已转换为Opus帧，帧数: " + opusFrames.size());
                             }
                         }
                     }
                     
                     // 发送给 ESP32
                     if (espSession.isOpen()) {
-                        if (oggFilePath != null) {
-                            // 读取 OGG 文件并发送二进制数据给 ESP32
-                            File oggFile = new File(oggFilePath);
-                            if (oggFile.exists()) {
-                                byte[] oggData = Files.readAllBytes(oggFile.toPath());
+                        if (opusFrames != null && !opusFrames.isEmpty()) {
+                            // 先发送文本信息，告知即将发送音频帧
+                            String jsonResponse = String.format(
+                                "{\"type\":\"tts\",\"state\":\"start\",\"text\":\"%s\",\"frame_count\":%d}",
+                                textResult.replace("\"", "\\\"").replace("\n", "\\n"),
+                                opusFrames.size()
+                            );
+                            espSession.sendMessage(new TextMessage(jsonResponse));
+                            
+                            // 逐帧发送 Opus 数据
+                            // 每帧 60ms，需要控制发送速率，防止设备端缓冲区溢出
+                            // 设备端解码队列有限，发送太快会导致 "decode queue full"
+                            int sentFrames = 0;
+                            for (int i = 0; i < opusFrames.size(); i++) {
+                                byte[] frame = opusFrames.get(i);
+                                if (espSession.isOpen()) {
+                                    espSession.sendMessage(new BinaryMessage(frame));
+                                    sentFrames++;
+                                    // 每发送10帧打印一次
+                                    if (sentFrames % 10 == 0) {
+                                        System.out.println("已发送 " + sentFrames + "/" + opusFrames.size() + " 帧, 当前帧大小: " + frame.length + " bytes");
+                                    }
+                                } else {
+                                    System.err.println("WebSocket 连接已断开，停止发送");
+                                    break;
+                                }
                                 
-                                // 先发送文本信息
-                                String jsonResponse = String.format(
-                                    "{\"type\":\"tts\",\"text\":\"%s\",\"audio_size\":%d}",
-                                    textResult.replace("\"", "\\\"").replace("\n", "\\n"),
-                                    oggData.length
-                                );
-                                espSession.sendMessage(new TextMessage(jsonResponse));
-                                
-                                // 再发送音频二进制数据
-                                espSession.sendMessage(new BinaryMessage(oggData));
-                                System.out.println("已发送音频到ESP32: " + oggData.length + " bytes");
+                                // 添加延迟，让发送速率略低于播放速率
+                                // 每帧 60ms 音频，发送间隔设为 50ms，给设备端留缓冲余量
+                                Thread.sleep(50);
                             }
+                            System.out.println("实际发送帧数: " + sentFrames);
+                            
+                            // 发送结束标识
+                            String endJson = "{\"type\":\"tts\",\"state\":\"end\"}";
+                            espSession.sendMessage(new TextMessage(endJson));
+                            
+                            System.out.println("已发送 " + opusFrames.size() + " 帧Opus音频到ESP32");
                         } else {
                             // 没有音频，只发送文本
                             String jsonResponse = String.format(

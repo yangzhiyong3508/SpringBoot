@@ -1,29 +1,44 @@
 package com.example.edog.utils;
 
+import io.github.jaredmdobson.concentus.OpusApplication;
+import io.github.jaredmdobson.concentus.OpusEncoder;
+
 import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 音频格式转换工具
- * 将 MP3 转换为设备可接受的 OGG/Opus 格式
+ * 将 MP3 转换为设备可接受的裸 Opus 帧格式
  * 
  * 设备端要求：
- * - 格式：OGG 容器 + Opus 编码
+ * - 格式：裸 Opus 帧（无 OGG 容器）
  * - 采样率：16000 Hz
  * - 声道：单声道 (mono)
  * - 帧时长：60ms
+ * - 传输方式：每个 WebSocket BinaryMessage 就是一帧 Opus 数据
  */
 public class AudioConverter {
 
     // FFmpeg 可执行文件路径
     private static final String FFMPEG_PATH = "D:\\Ffmepg\\bin\\ffmpeg.exe";
+    
+    // Opus 编码参数
+    private static final int SAMPLE_RATE = 24000;       // 采样率 24kHz (匹配设备端)
+    private static final int CHANNELS = 1;              // 单声道
+    private static final int FRAME_DURATION_MS = 60;    // 帧时长 60ms
+    private static final int FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS / 1000; // 每帧采样数 = 1440
+    private static final int BITRATE = 32000;           // 比特率 32kbps
 
     /**
-     * 将 MP3 文件转换为 OGG/Opus 格式
+     * 将 MP3 文件转换为裸 Opus 帧列表
      * @param inputMp3Path 输入的 MP3 文件路径
-     * @return 转换后的 OGG 文件路径，失败返回 null
+     * @return Opus 帧列表，每个 byte[] 是一帧 Opus 数据，失败返回 null
      */
-    public static String convertMp3ToOpusOgg(String inputMp3Path) {
+    public static List<byte[]> convertMp3ToOpusFrames(String inputMp3Path) {
         if (inputMp3Path == null || inputMp3Path.isEmpty()) {
             return null;
         }
@@ -34,72 +49,161 @@ public class AudioConverter {
             return null;
         }
 
-        // 生成输出文件路径 (将 .mp3 替换为 .ogg)
-        String outputPath = inputMp3Path.replaceAll("\\.[^.]+$", ".ogg");
-
         try {
-            // 使用 FFmpeg 转换
-            // 参数说明：
-            // -y: 覆盖输出文件
-            // -i: 输入文件
-            // -c:a libopus: 使用 Opus 编码器
-            // -ar 16000: 采样率 16kHz
-            // -ac 1: 单声道
-            // -b:a 24k: 比特率 24kbps (适合语音)
-            // -application voip: 优化语音
-            // -frame_duration 60: 帧时长 60ms (与设备端匹配)
+            // 1. 使用 FFmpeg 将 MP3 转换为 PCM (16-bit signed little-endian)
+            byte[] pcmData = convertMp3ToPcm(inputMp3Path);
+            if (pcmData == null || pcmData.length == 0) {
+                System.err.println("MP3 转 PCM 失败");
+                return null;
+            }
+
+            System.out.println("PCM 数据大小: " + pcmData.length + " bytes, 时长约: " + 
+                (pcmData.length / 2.0 / SAMPLE_RATE) + " 秒");
+
+            // 2. 将 PCM 编码为 Opus 帧
+            return encodePcmToOpusFrames(pcmData);
+
+        } catch (Exception e) {
+            System.err.println("音频转换异常: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    /**
+     * 使用 FFmpeg 将 MP3 转换为原始 PCM 数据
+     * @param inputMp3Path MP3 文件路径
+     * @return PCM 字节数据 (16-bit signed little-endian, 16kHz, mono)
+     */
+    private static byte[] convertMp3ToPcm(String inputMp3Path) {
+        try {
+            // FFmpeg 命令：将 MP3 转换为 16kHz 单声道 16-bit PCM，输出到 stdout
             ProcessBuilder pb = new ProcessBuilder(
                 FFMPEG_PATH,
                 "-y",
                 "-i", inputMp3Path,
-                "-c:a", "libopus",
-                "-ar", "16000",
-                "-ac", "1",
-                "-b:a", "24k",
-                "-application", "voip",
-                "-frame_duration", "60",
-                outputPath
+                "-ar", String.valueOf(SAMPLE_RATE),  // 采样率 16000
+                "-ac", String.valueOf(CHANNELS),     // 单声道
+                "-f", "s16le",                       // 16-bit signed little-endian
+                "-acodec", "pcm_s16le",
+                "pipe:1"                             // 输出到 stdout
             );
 
-            pb.redirectErrorStream(true);
+            pb.redirectErrorStream(false);
             Process process = pb.start();
 
-            // 读取输出
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            // 读取 PCM 数据
+            ByteArrayOutputStream pcmOutput = new ByteArrayOutputStream();
+            try (InputStream is = process.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = is.read(buffer)) != -1) {
+                    pcmOutput.write(buffer, 0, bytesRead);
+                }
+            }
+
+            // 读取错误输出（可选）
+            try (BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    // 可以打印 FFmpeg 输出用于调试
-                    // System.out.println("[FFmpeg] " + line);
+                while ((line = errorReader.readLine()) != null) {
+                    // 可以打印 FFmpeg 错误输出用于调试
+                    // System.err.println("[FFmpeg] " + line);
                 }
             }
 
             int exitCode = process.waitFor();
             if (exitCode == 0) {
-                File outputFile = new File(outputPath);
-                if (outputFile.exists()) {
-                    System.out.println("音频转换成功: " + outputPath + " (" + outputFile.length() / 1024 + " KB)");
-                    return outputPath;
-                }
+                return pcmOutput.toByteArray();
             } else {
                 System.err.println("FFmpeg 转换失败，退出码: " + exitCode);
+                return null;
             }
 
         } catch (Exception e) {
-            System.err.println("音频转换异常: " + e.getMessage());
-            // 如果 FFmpeg 不可用，尝试使用备用方案
-            return tryFallbackConversion(inputMp3Path, outputPath);
+            System.err.println("MP3 转 PCM 异常: " + e.getMessage());
+            return null;
         }
-
-        return null;
     }
 
     /**
-     * 将 MP3 字节数据转换为 OGG/Opus 格式
+     * 将 PCM 数据编码为 Opus 帧列表
+     * @param pcmData PCM 字节数据 (16-bit signed little-endian)
+     * @return Opus 帧列表
+     */
+    private static List<byte[]> encodePcmToOpusFrames(byte[] pcmData) {
+        List<byte[]> opusFrames = new ArrayList<>();
+
+        try {
+            // 创建 Opus 编码器
+            OpusEncoder encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS, OpusApplication.OPUS_APPLICATION_VOIP);
+            encoder.setBitrate(BITRATE);
+            encoder.setSignalType(io.github.jaredmdobson.concentus.OpusSignal.OPUS_SIGNAL_VOICE);
+
+            // 输出缓冲区
+            byte[] outputBuffer = new byte[4000]; // Opus 帧最大大小
+
+            // 将 PCM 转换为 short 数组
+            int totalSamples = pcmData.length / 2;
+            int frameCount = totalSamples / FRAME_SIZE;
+
+            System.out.println("总采样数: " + totalSamples + ", 帧数: " + frameCount);
+
+            ByteBuffer bb = ByteBuffer.wrap(pcmData).order(ByteOrder.LITTLE_ENDIAN);
+            short[] pcmSamples = new short[totalSamples];
+            for (int i = 0; i < totalSamples; i++) {
+                pcmSamples[i] = bb.getShort();
+            }
+
+            // 逐帧编码
+            for (int frame = 0; frame < frameCount; frame++) {
+                int offset = frame * FRAME_SIZE;
+                
+                // 获取当前帧的 PCM 数据
+                short[] frameData = new short[FRAME_SIZE];
+                System.arraycopy(pcmSamples, offset, frameData, 0, FRAME_SIZE);
+
+                // 编码为 Opus
+                int encodedBytes = encoder.encode(frameData, 0, FRAME_SIZE, outputBuffer, 0, outputBuffer.length);
+
+                if (encodedBytes > 0) {
+                    byte[] opusFrame = new byte[encodedBytes];
+                    System.arraycopy(outputBuffer, 0, opusFrame, 0, encodedBytes);
+                    opusFrames.add(opusFrame);
+                }
+            }
+
+            // 处理剩余数据（如果不足一帧，补零）
+            int remainingSamples = totalSamples % FRAME_SIZE;
+            if (remainingSamples > 0) {
+                short[] lastFrame = new short[FRAME_SIZE];
+                System.arraycopy(pcmSamples, frameCount * FRAME_SIZE, lastFrame, 0, remainingSamples);
+                // 剩余部分补零（静音）
+
+                int encodedBytes = encoder.encode(lastFrame, 0, FRAME_SIZE, outputBuffer, 0, outputBuffer.length);
+                if (encodedBytes > 0) {
+                    byte[] opusFrame = new byte[encodedBytes];
+                    System.arraycopy(outputBuffer, 0, opusFrame, 0, encodedBytes);
+                    opusFrames.add(opusFrame);
+                }
+            }
+
+            System.out.println("Opus 编码完成，总帧数: " + opusFrames.size());
+
+        } catch (Exception e) {
+            System.err.println("Opus 编码异常: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        return opusFrames;
+    }
+
+    /**
+     * 将 MP3 字节数据转换为 Opus 帧列表
      * @param mp3Data MP3 音频数据
      * @param tempDir 临时文件目录
-     * @return 转换后的 OGG 文件字节数据，失败返回 null
+     * @return Opus 帧列表
      */
-    public static byte[] convertMp3BytesToOpusOgg(byte[] mp3Data, String tempDir) {
+    public static List<byte[]> convertMp3BytesToOpusFrames(byte[] mp3Data, String tempDir) {
         if (mp3Data == null || mp3Data.length == 0) {
             return null;
         }
@@ -117,23 +221,12 @@ public class AudioConverter {
             Files.write(tempMp3.toPath(), mp3Data);
 
             // 转换
-            String oggPath = convertMp3ToOpusOgg(tempMp3.getAbsolutePath());
-
-            // 读取 OGG 文件
-            byte[] oggData = null;
-            if (oggPath != null) {
-                File oggFile = new File(oggPath);
-                if (oggFile.exists()) {
-                    oggData = Files.readAllBytes(oggFile.toPath());
-                    // 删除临时 OGG 文件
-                    oggFile.delete();
-                }
-            }
+            List<byte[]> opusFrames = convertMp3ToOpusFrames(tempMp3.getAbsolutePath());
 
             // 删除临时 MP3 文件
-            tempMp3.delete();
+            Files.deleteIfExists(tempMp3.toPath());
 
-            return oggData;
+            return opusFrames;
 
         } catch (Exception e) {
             System.err.println("转换字节数据失败: " + e.getMessage());
@@ -157,41 +250,10 @@ public class AudioConverter {
     }
 
     /**
-     * 备用转换方案（当 FFmpeg 不可用时）
+     * 获取编码参数信息
      */
-    private static String tryFallbackConversion(String inputPath, String outputPath) {
-        System.err.println("FFmpeg 不可用，请确认路径: " + FFMPEG_PATH);
-        return null;
-    }
-
-    /**
-     * 获取音频文件信息
-     */
-    public static void printAudioInfo(String filePath) {
-        try {
-            ProcessBuilder pb = new ProcessBuilder(
-                "ffprobe",
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_format",
-                "-show_streams",
-                filePath
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                StringBuilder output = new StringBuilder();
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                }
-                System.out.println("音频信息:\n" + output);
-            }
-
-            process.waitFor();
-        } catch (Exception e) {
-            System.err.println("获取音频信息失败: " + e.getMessage());
-        }
+    public static String getEncodingInfo() {
+        return String.format("Opus编码参数: 采样率=%dHz, 声道=%d, 帧时长=%dms, 帧大小=%d采样, 比特率=%dbps",
+                SAMPLE_RATE, CHANNELS, FRAME_DURATION_MS, FRAME_SIZE, BITRATE);
     }
 }
