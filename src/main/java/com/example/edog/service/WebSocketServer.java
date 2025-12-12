@@ -1,330 +1,282 @@
 package com.example.edog.service;
 
-import com.example.edog.configurer.ASRClient;
+import com.example.edog.entity.Account;
 import com.example.edog.utils.AudioConverter;
-import com.example.edog.utils.BaiduAuthService;
 import com.example.edog.utils.CozeAPI;
-import com.example.edog.utils.WavFileUtil;
-import io.github.jaredmdobson.concentus.OpusDecoder;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.nio.ByteBuffer;
-import java.time.LocalDateTime;
 import java.util.List;
-import java.time.format.DateTimeFormatter;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class WebSocketServer extends AbstractWebSocketHandler {
 
-    private static final String RECORD_DIR = "recordings";
-    private static final int SAMPLE_RATE = 16000;
-    private static final int CHANNELS = 1;
+    private static final Logger log = LoggerFactory.getLogger(WebSocketServer.class);
 
-    /** 每个 session 一个 Opus 解码器 */
-    private final Map<String, OpusDecoder> decoders = new ConcurrentHashMap<>();
+    @Autowired
+    private AliyunTokenService tokenService;
 
-    /** 解码后的 PCM 缓冲 */
-    private final Map<String, ByteArrayOutputStream> pcmBuffers = new ConcurrentHashMap<>();
+    private final Map<String, AliyunRealtimeASR> asrServices = new ConcurrentHashMap<>();
+    private final Map<String, Timer> sessionTimers = new ConcurrentHashMap<>(); 
+    private final Map<String, AtomicBoolean> sessionBusyState = new ConcurrentHashMap<>();
+    
+    // 记录最后一次发送给 ASR 数据的时间戳
+    private final Map<String, Long> lastAsrSendTime = new ConcurrentHashMap<>();
 
-    /** 心跳 */
-    private final Map<String, Timer> heartbeats = new ConcurrentHashMap<>();
-
-    /** 每个 session 对应的百度 ASR 客户端 */
-    private final Map<String, ASRClient> asrClients = new ConcurrentHashMap<>();
-
-    /** Coze API 客户端 */
     private final CozeAPI cozeAPI = new CozeAPI();
+
+    private static volatile String currentVoiceId = "7568423452617523254";
+    private static volatile Double currentSpeedRatio = 1.0;
+
+    // Opus 静音帧
+    private static final byte[] OPUS_SILENCE_FRAME = new byte[]{(byte) 0xF8, (byte) 0xFF, (byte) 0xFE};
+
+    public static void setVoiceParams(Account account) {
+        if (account != null) {
+            if (account.getVoiceId() != null && !account.getVoiceId().isEmpty()) {
+                currentVoiceId = account.getVoiceId();
+            }
+            if (account.getSpeedRatio() != null) {
+                currentSpeedRatio = account.getSpeedRatio();
+            }
+            log.info("语音参数已全局更新: voiceId={}, speed={}", currentVoiceId, currentSpeedRatio);
+        }
+    }
+
+    public static void setVoiceParams(String voiceId, Double speedRatio) {
+        if (voiceId != null && !voiceId.isEmpty()) currentVoiceId = voiceId;
+        if (speedRatio != null) currentSpeedRatio = speedRatio;
+        log.info("语音参数已全局更新: voiceId={}, speed={}", currentVoiceId, currentSpeedRatio);
+    }
 
     @Override
     public void afterConnectionEstablished(@NotNull WebSocketSession session) throws Exception {
         String id = session.getId();
-        System.out.println("ESP32 连接: " + id);
+        log.info("ESP32 Connected: {}", id);
 
-        decoders.put(id, new OpusDecoder(SAMPLE_RATE, CHANNELS));
-        pcmBuffers.put(id, new ByteArrayOutputStream());
+        sessionBusyState.put(id, new AtomicBoolean(false));
+        lastAsrSendTime.put(id, System.currentTimeMillis()); 
 
-        // 初始化百度 ASR 客户端
-        initASRClient(id, session);
+        AliyunRealtimeASR asr = new AliyunRealtimeASR();
+        asr.setOnResultCallback(text -> {
+            if (isSessionBusy(id)) return;
+            handleUserQuestion(session, text);
+        });
 
-        Timer hb = new Timer(true);
-        hb.scheduleAtFixedRate(new TimerTask() {
+        try {
+            String token = tokenService.getToken();
+            asr.start(token);
+            asrServices.put(id, asr);
+        } catch (Exception e) {
+            log.error("ASR 启动失败", e);
+            session.close();
+            return;
+        }
+
+        // 启动定时任务
+        Timer timer = new Timer(true);
+        
+        // 1. WebSocket 心跳
+        timer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
                 try {
-                    if (session.isOpen()) {
-                        session.sendMessage(new PingMessage());
-                    } else {
-                        cancelSession(id);
-                    }
-                } catch (Exception e) {
-                    cancelSession(id);
-                }
+                    if (session.isOpen()) session.sendMessage(new PingMessage());
+                } catch (Exception e) {}
             }
         }, 5000, 5000);
 
-        heartbeats.put(id, hb);
+        // 2. ASR 保活任务
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    AliyunRealtimeASR currentAsr = asrServices.get(id);
+                    if (currentAsr == null || !session.isOpen()) return;
+
+                    long lastTime = lastAsrSendTime.getOrDefault(id, 0L);
+                    long now = System.currentTimeMillis();
+
+                    if (now - lastTime > 800) {
+                        currentAsr.sendOpusStream(OPUS_SILENCE_FRAME);
+                        lastAsrSendTime.put(id, now);
+                    }
+                } catch (Exception e) {
+                    log.error("保活帧发送失败", e);
+                }
+            }
+        }, 1000, 500); 
+
+        sessionTimers.put(id, timer);
     }
 
-    /**
-     * 初始化百度 ASR 客户端
-     */
-    private void initASRClient(String sessionId, WebSocketSession espSession) {
-        try {
-            String token = BaiduAuthService.getAccessToken();
-            ASRClient asrClient = new ASRClient(token);
+    @Override
+    protected void handleBinaryMessage(@NotNull WebSocketSession session, @NotNull BinaryMessage message) {
+        String id = session.getId();
+        AliyunRealtimeASR asr = asrServices.get(id);
 
-            // 设置识别结果回调 - 将结果发送回 ESP32
-            asrClient.setRecognitionCallback(result -> {
-                // 过滤心跳消息
-                if (result.contains("\"type\":\"HEARTBEAT\"")) {
-                    return;
+        if (asr != null) {
+            try {
+                lastAsrSendTime.put(id, System.currentTimeMillis());
+
+                if (isSessionBusy(id)) {
+                    asr.sendOpusStream(OPUS_SILENCE_FRAME);
+                } else {
+                    ByteBuffer payload = message.getPayload();
+                    byte[] opusData = new byte[payload.remaining()];
+                    payload.get(opusData);
+                    asr.sendOpusStream(opusData);
                 }
-                
-                // 只处理最终识别结果 (FIN_TEXT)
-                if (result.contains("\"type\":\"FIN_TEXT\"")) {
-                    // 提取识别文本
-                    int resultStart = result.indexOf("\"result\":\"");
-                    if (resultStart != -1) {
-                        resultStart += 10;
-                        int resultEnd = result.indexOf("\"", resultStart);
-                        if (resultEnd != -1) {
-                            String text = result.substring(resultStart, resultEnd);
-                            if (!text.isEmpty()) {
-                                System.out.println("🎤 ASR识别结果: " + text);
-                                
-                                // 调用 Coze API 获取回复
-                                sendToCozeAPI(text, espSession);
-                            }
-                        }
-                    }
-                } else if (result.contains("\"err_no\"") && !result.contains("\"err_no\":0")) {
-                    // 输出错误信息（排除正常的 err_no:0）
-                    System.err.println("ASR错误: " + result);
-                }
-            });
-
-            // 连接百度 ASR
-            asrClient.connectBlocking();
-            asrClients.put(sessionId, asrClient);
-            System.out.println("百度ASR客户端已连接 (session: " + sessionId + ")");
-
-        } catch (Exception e) {
-            System.err.println("初始化百度ASR客户端失败: " + e.getMessage());
+            } catch (Exception e) {
+                log.error("ASR 发送异常, 尝试重置", e);
+                resetAsr(session, id, asr);
+            }
         }
     }
 
-    /**
-     * 调用 Coze API 并将结果发送给 ESP32
-     */
-    private void sendToCozeAPI(String question, WebSocketSession espSession) {
-        // 异步调用 Coze API，避免阻塞
+    private void resetAsr(WebSocketSession session, String id, AliyunRealtimeASR oldAsr) {
+        if (oldAsr != null) oldAsr.stop();
+        AliyunRealtimeASR newAsr = new AliyunRealtimeASR();
+        newAsr.setOnResultCallback(text -> {
+            if (!isSessionBusy(id)) handleUserQuestion(session, text);
+        });
+        try {
+            newAsr.start(tokenService.getToken());
+            asrServices.put(id, newAsr);
+            log.info("ASR 引擎已自动恢复");
+        } catch (Exception ex) {
+            log.error("ASR 恢复失败", ex);
+        }
+    }
+
+    private void handleUserQuestion(WebSocketSession session, String question) {
+        String id = session.getId();
+        setSessionBusy(id, true);
+
         new Thread(() -> {
             try {
-                System.out.println("发送到Coze: " + question);
-                
-                // 调用 Coze API (stream=true 获取流式响应)
-                String[] response = cozeAPI.CozeRequest(question, true);
-                
+                String shouldUseVoiceId = currentVoiceId;
+                Double shouldUseSpeed = currentSpeedRatio;
+
+                log.info("请求智能体: '{}' (Locking session)", question);
+
+                String[] response = cozeAPI.CozeRequest(question, shouldUseVoiceId, shouldUseSpeed, true);
+
                 if (response != null && response.length >= 2) {
                     String audioUrl = response[0];
-                    String textResult = response[1];
-                    
-                    // 打印结果
-                    System.out.println("音频URL: " + (audioUrl.isEmpty() ? "无" : audioUrl));
-                    System.out.println("文本结果: " + textResult);
-                    
-                    // 下载并转换音频为裸 Opus 帧
-                    List<byte[]> opusFrames = null;
-                    if (!audioUrl.isEmpty()) {
-                        // 1. 下载 MP3
-                        String mp3FilePath = cozeAPI.downloadAudio(audioUrl, "coze_audio");
-                        
-                        // 2. 转换为裸 Opus 帧 (设备端要求的格式)
-                        if (mp3FilePath != null) {
-                            opusFrames = AudioConverter.convertMp3ToOpusFrames(mp3FilePath);
+                    String replyText = response[1];
+
+                    if (!session.isOpen()) {
+                        setSessionBusy(id, false);
+                        return;
+                    }
+
+                    // 1. 发送文本
+                    String startJson = String.format("{\"type\":\"tts\",\"state\":\"start\",\"text\":\"%s\"}",
+                            replyText.replace("\"", "\\\"").replace("\n", ""));
+                    session.sendMessage(new TextMessage(startJson));
+
+                    // 2. 发送音频
+                    long estimatedPlaybackDuration = 0;
+                    long timeSpentSending = 0; 
+
+                    if (audioUrl != null && !audioUrl.isEmpty()) {
+                        String mp3Path = cozeAPI.downloadAudio(audioUrl, "coze_audio");
+                        if (mp3Path != null) {
+                            List<byte[]> opusFrames = AudioConverter.convertMp3ToOpusFrames(mp3Path);
                             if (opusFrames != null && !opusFrames.isEmpty()) {
-                                System.out.println("音频已转换为Opus帧，帧数: " + opusFrames.size());
-                            }
-                        }
-                    }
-                    
-                    // 发送给 ESP32
-                    if (espSession.isOpen()) {
-                        if (opusFrames != null && !opusFrames.isEmpty()) {
-                            // 先发送文本信息，告知即将发送音频帧
-                            String jsonResponse = String.format(
-                                "{\"type\":\"tts\",\"state\":\"start\",\"text\":\"%s\",\"frame_count\":%d}",
-                                textResult.replace("\"", "\\\"").replace("\n", "\\n"),
-                                opusFrames.size()
-                            );
-                            espSession.sendMessage(new TextMessage(jsonResponse));
-                            
-                            // 逐帧发送 Opus 数据
-                            // 每帧 60ms，需要控制发送速率，防止设备端缓冲区溢出
-                            // 设备端解码队列有限，发送太快会导致 "decode queue full"
-                            int sentFrames = 0;
-                            for (int i = 0; i < opusFrames.size(); i++) {
-                                byte[] frame = opusFrames.get(i);
-                                if (espSession.isOpen()) {
-                                    espSession.sendMessage(new BinaryMessage(frame));
-                                    sentFrames++;
-                                    // 每发送10帧打印一次
-                                    if (sentFrames % 10 == 0) {
-                                        System.out.println("已发送 " + sentFrames + "/" + opusFrames.size() + " 帧, 当前帧大小: " + frame.length + " bytes");
-                                    }
-                                } else {
-                                    System.err.println("WebSocket 连接已断开，停止发送");
-                                    break;
+                                int frameDurationMs = 60;
+                                estimatedPlaybackDuration = (long) opusFrames.size() * frameDurationMs;
+                                timeSpentSending = (long) opusFrames.size() * 50;
+
+                                log.info("音频帧数: {}, 预估播放时长: {} ms", opusFrames.size(), estimatedPlaybackDuration);
+
+                                for (byte[] frame : opusFrames) {
+                                    if (!session.isOpen()) break;
+                                    session.sendMessage(new BinaryMessage(frame));
+                                    
+                                    // 发送数据也要更新时间戳，避免ASR保活逻辑冲突
+                                    lastAsrSendTime.put(id, System.currentTimeMillis());
+                                    Thread.sleep(50); 
                                 }
-                                
-                                // 添加延迟，让发送速率略低于播放速率
-                                // 每帧 60ms 音频，发送间隔设为 50ms，给设备端留缓冲余量
-                                Thread.sleep(50);
                             }
-                            System.out.println("实际发送帧数: " + sentFrames);
-                            
-                            // 发送结束标识
-                            String endJson = "{\"type\":\"tts\",\"state\":\"end\"}";
-                            espSession.sendMessage(new TextMessage(endJson));
-                            
-                            System.out.println("已发送 " + opusFrames.size() + " 帧Opus音频到ESP32");
-                        } else {
-                            // 没有音频，只发送文本
-                            String jsonResponse = String.format(
-                                "{\"type\":\"text\",\"text\":\"%s\"}",
-                                textResult.replace("\"", "\\\"").replace("\n", "\\n")
-                            );
-                            espSession.sendMessage(new TextMessage(jsonResponse));
                         }
-                        System.out.println("已发送Coze回复到ESP32");
+                    } else {
+                        estimatedPlaybackDuration = 2000;
+                        timeSpentSending = 0;
                     }
-                } else if (response != null && response.length == 1) {
-                    System.err.println("Coze API 返回: " + response[0]);
+
+                    // 3. 发送结束标志
+                    if (session.isOpen()) {
+                        session.sendMessage(new TextMessage("{\"type\":\"tts\",\"state\":\"end\"}"));
+                    }
+
+                    long bufferTime = 0; 
+                    long remainingWait = estimatedPlaybackDuration - timeSpentSending;
+                    if (remainingWait < 0) remainingWait = 0;
+                    long unlockDelay = remainingWait + bufferTime;
+
+                    log.info("发送完毕。设备预计还需播放 {} ms，将在 {} ms 后解锁输入", remainingWait, unlockDelay);
+
+                    new Timer().schedule(new TimerTask() {
+                        @Override
+                        public void run() {
+                            setSessionBusy(id, false);
+                            log.info("会话已解锁，准备接收新语音");
+                        }
+                    }, unlockDelay);
+
+                } else {
+                    setSessionBusy(id, false);
                 }
-                
             } catch (Exception e) {
-                System.err.println("Coze API 调用失败: " + e.getMessage());
+                log.error("处理失败", e);
+                setSessionBusy(id, false);
             }
         }).start();
     }
 
-    @Override
-    protected void handleBinaryMessage(@NotNull WebSocketSession session,
-                                    @NotNull BinaryMessage message) {
+    private boolean isSessionBusy(String sessionId) {
+        AtomicBoolean state = sessionBusyState.get(sessionId);
+        return state != null && state.get();
+    }
 
-        String id = session.getId();
-        OpusDecoder decoder = decoders.get(id);
-        ByteArrayOutputStream pcm = pcmBuffers.get(id);
-        ASRClient asrClient = asrClients.get(id);
-
-        if (decoder == null || pcm == null) {
-            return;
-        }
-
-        ByteBuffer payload = message.getPayload();
-        byte[] opusData = new byte[payload.remaining()];
-        payload.get(opusData);
-
-        // 单帧最大 60 ms（Opus 规范）
-        short[] pcmFrame = new short[960 * CHANNELS];
-
-        try {
-            int samples = decoder.decode(
-                    opusData, 0, opusData.length,
-                    pcmFrame, 0, pcmFrame.length, false
-            );
-
-            if (samples > 0) {
-                // short → little-endian PCM16
-                byte[] pcmBytes = new byte[samples * 2];
-                for (int i = 0; i < samples; i++) {
-                    short s = pcmFrame[i];
-                    pcmBytes[i * 2] = (byte) (s & 0xff);
-                    pcmBytes[i * 2 + 1] = (byte) ((s >> 8) & 0xff);
-                }
-
-                // 保存到缓冲区（用于生成WAV文件）
-                pcm.write(pcmBytes);
-
-                // 实时发送给百度 ASR
-                if (asrClient != null && asrClient.isOpen()) {
-                    asrClient.sendAudio(pcmBytes);
-                }
-            }
-
-        } catch (Exception e) {
-            System.err.println("Opus 解码失败: " + e.getMessage());
+    private void setSessionBusy(String sessionId, boolean busy) {
+        AtomicBoolean state = sessionBusyState.get(sessionId);
+        if (state != null) {
+            state.set(busy);
         }
     }
 
     @Override
     public void afterConnectionClosed(@NotNull WebSocketSession session, @NotNull CloseStatus status) {
-        cancelSession(session.getId());
+        String id = session.getId();
+        log.info("ESP32 Disconnected: {}", id);
+
+        AliyunRealtimeASR asr = asrServices.remove(id);
+        if (asr != null) asr.stop();
+
+        Timer timer = sessionTimers.remove(id);
+        if (timer != null) timer.cancel();
+
+        sessionBusyState.remove(id);
+        lastAsrSendTime.remove(id);
     }
 
     @Override
     public void handleTransportError(@NotNull WebSocketSession session, @NotNull Throwable exception) {
-        cancelSession(session.getId());
-    }
-
-    private synchronized void cancelSession(String id) {
-        Timer hb = heartbeats.remove(id);
-        if (hb != null) hb.cancel();
-
-        decoders.remove(id);
-        ByteArrayOutputStream pcm = pcmBuffers.remove(id);
-
-        // 关闭百度 ASR 客户端
-        ASRClient asrClient = asrClients.remove(id);
-        if (asrClient != null) {
-            try {
-                asrClient.finish();  // 发送 FINISH 消息
-                // 延迟关闭，等待最后的识别结果
-                new Timer(true).schedule(new TimerTask() {
-                    @Override
-                    public void run() {
-                        if (asrClient.isOpen()) {
-                            asrClient.close();
-                        }
-                    }
-                }, 3000);
-            } catch (Exception e) {
-                System.err.println("关闭ASR客户端失败: " + e.getMessage());
-            }
-        }
-
-        if (pcm != null && pcm.size() > 0) {
-            try {
-                File dir = new File(RECORD_DIR);
-                if (!dir.exists()) dir.mkdirs();
-
-                String ts = LocalDateTime.now()
-                        .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-
-                File wav = new File(
-                        RECORD_DIR,
-                        "opus_" + id.substring(0, 8) + "_" + ts + ".wav"
-                );
-
-                WavFileUtil.savePcmAsWav(pcm.toByteArray(), wav);
-
-                System.out.println("WAV 已生成: " + wav.getAbsolutePath());
-
-            } catch (Exception e) {
-                System.err.println("保存 WAV 失败: " + e.getMessage());
-            }
-        }
-
-        System.out.println("ESP32 断开: " + id);
+        afterConnectionClosed(session, CloseStatus.SERVER_ERROR);
     }
 
     @Override

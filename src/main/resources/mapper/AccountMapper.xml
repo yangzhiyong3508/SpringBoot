@@ -5,82 +5,65 @@
 
 <mapper namespace="com.example.edog.mapper.AccountMapper">
 
-    <!-- ✅ 通用结果映射 -->
     <resultMap id="AccountResultMap" type="com.example.edog.entity.Account">
         <id column="id" property="id"/>
         <result column="account" property="account"/>
         <result column="password" property="password"/>
         <result column="avatar_url" property="avatarUrl"/>
-        <result column="per" property="per"/>
-        <result column="spd" property="spd"/>
-        <result column="pid" property="pid"/>
         <result column="vol" property="vol"/>
         <result column="username" property="username"/>
         <result column="wake_word" property="wakeWord"/>
+        <result column="voice_id" property="voiceId"/>
+        <result column="speed_ratio" property="speedRatio"/>
     </resultMap>
 
-    <!-- ✅ 查询所有账户 -->
     <select id="selectAll" resultMap="AccountResultMap">
         SELECT * FROM Account
     </select>
 
-    <!-- ✅ 根据账号查询（单个） -->
     <select id="selectByAccount" parameterType="long" resultMap="AccountResultMap">
         SELECT * FROM Account WHERE account = #{account}
     </select>
 
-    <!-- ✅ 根据账号查询（多个） -->
     <select id="selectListByAccount" parameterType="long" resultMap="AccountResultMap">
         SELECT * FROM Account WHERE account = #{account}
     </select>
 
-    <!-- ✅ 插入账户 -->
     <insert id="insert" parameterType="com.example.edog.entity.Account" useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO Account (account, password, avatar_url, per, spd, pid, vol, username, wake_word)
-        VALUES (#{account}, #{password}, #{avatarUrl}, #{per}, #{spd}, #{pid}, #{vol}, #{username}, #{wakeWord})
+        INSERT INTO Account (
+            account, password, avatar_url, username, wake_word, vol, voice_id, speed_ratio
+        )
+        VALUES (
+            #{account}, #{password}, #{avatarUrl}, #{username}, #{wakeWord}, #{vol}, #{voiceId}, #{speedRatio}
+        )
     </insert>
 
-    <!-- ✅ 更新密码 -->
     <update id="updatePassword" parameterType="com.example.edog.entity.Account">
-        UPDATE Account
-        SET password = #{password}
-        WHERE account = #{account}
+        UPDATE Account SET password = #{password} WHERE account = #{account}
     </update>
 
-    <!-- ✅ 删除账户 -->
     <delete id="deleteByAccount" parameterType="long">
         DELETE FROM Account WHERE account = #{account}
     </delete>
 
-    <!-- ✅ 更新语音参数（不含唤醒词） -->
     <update id="updateVoice" parameterType="com.example.edog.entity.Account">
         UPDATE Account
-        SET per = #{per},
-            spd = #{spd},
-            pid = #{pid},
-            vol = #{vol}
+        SET vol = #{vol},
+            voice_id = #{voiceId},
+            speed_ratio = #{speedRatio}
         WHERE account = #{account}
     </update>
 
-    <!-- ✅ 更新头像 -->
     <update id="updateAvatar" parameterType="com.example.edog.entity.Account">
-        UPDATE Account
-        SET avatar_url = #{avatarUrl}
-        WHERE account = #{account}
+        UPDATE Account SET avatar_url = #{avatarUrl} WHERE account = #{account}
     </update>
 
-    <!-- ✅ 更新用户名 -->
     <update id="updateUsername" parameterType="com.example.edog.entity.Account">
-        UPDATE Account
-        SET username = #{username}
-        WHERE account = #{account}
+        UPDATE Account SET username = #{username} WHERE account = #{account}
     </update>
 
-    <!-- ✅ 更新唤醒词（单独接口使用） -->
     <update id="updateWakeWord" parameterType="com.example.edog.entity.Account">
-        UPDATE Account
-        SET wake_word = #{wakeWord}
-        WHERE account = #{account}
+        UPDATE Account SET wake_word = #{wakeWord} WHERE account = #{account}
     </update>
 
 </mapper>

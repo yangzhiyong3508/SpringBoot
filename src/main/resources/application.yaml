@@ -21,6 +21,12 @@ kouzi:
     token: sat_LeDY8iu23Ifcb2UwY7LXfZeL0HhoF4NTswQmlooFVJyRJNd7ExEk9gFogjnRPbPl
     bot-id: "7534905232841785370"
 
+# 阿里云占位配置（开发环境可使用占位，请在生产环境使用真实凭证）
+aliyun:
+  appKey: "*************************"
+  accessKeyId: "****************************"
+  accessKeySecret: "******************************"
+
 mybatis:
   mapper-locations: classpath:mapper/*.xml
   type-aliases-package: com.example.edog.entity

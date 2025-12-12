@@ -13,8 +13,10 @@ public interface AccountMapper {
     int updatePassword(Account account);
     int deleteByAccount(Long account);
 
-    int updateVoice(Account account);        // ✅ 仅更新语音参数
-    int updateAvatar(Account account);       // ✅ 更新头像URL
+    // ✅ 更新语音参数 (只更新 vol, voice_id, speed_ratio)
+    int updateVoice(Account account);
+
+    int updateAvatar(Account account);
     int updateUsername(Account account);
-    int updateWakeWord(Account account);     // ✅ 唤醒词单独接口
+    int updateWakeWord(Account account);
 }
